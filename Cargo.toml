@@ -14,3 +14,4 @@ serde_json = "1.0.79"
 thiserror = "1.0.30"
 tokio = { version = "1.17.0", features = ["full"]}
 tokio-util = { version = "0.7.0", features = ["full"] }
+clap = { version = "3.0", features = ["derive"] }
