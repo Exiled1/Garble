@@ -17,6 +17,11 @@ pub struct ChatClient {
 }
 
 impl ChatClient {
-
+    fn new(port: usize, hostname: String) -> Self{
+        ChatClient{
+            port,
+            hostname
+        }
+    }
 }
 
