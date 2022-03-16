@@ -1,4 +1,6 @@
 use std::env;
+use garble::client::ChatClient;
+use garble::server::Server;
 
 #[tokio::main]
 async fn main() {
@@ -20,4 +22,24 @@ async fn main() {
 
     println!("{}", host);
     println!("{}", port);
+
+    let chat_client = ChatClient::new(port, host); // make a new oop 
+
+    chat_client.serverconnect().await?;
+
+    loop {
+        tokio::select! {
+            _ = chat_client.send_message() => {
+                println!("Send message!");
+            }
+            msg = chat_client.recieve_message() => {
+                println!("{msg}");
+            }
+            _ = chat_client.terminate_connection() => {
+                println!("Terminating connection");
+                break;
+            }
+        }
+    }
+    
 }

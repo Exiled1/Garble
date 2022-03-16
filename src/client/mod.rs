@@ -20,8 +20,12 @@ pub struct ChatClient {
 }
 
 impl ChatClient {
+<<<<<<< Updated upstream
     // Makes a connection to the port:hostname, and sets our username, does not set the pub/priv key pair yet.
     pub async fn new(port: usize, hostname: String, username: String) -> Self{
+=======
+    pub fn new(port: usize, hostname: String) -> Self{
+>>>>>>> Stashed changes
         ChatClient{
             username,
             port,
