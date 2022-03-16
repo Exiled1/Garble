@@ -20,6 +20,7 @@ pub struct MessageCodec<Tx: Serialize, Rx: DeserializeOwned>(
     std::marker::PhantomData<Tx>,
     std::marker::PhantomData<Rx>,
 );
+
 impl<Tx: Serialize, Rx: DeserializeOwned> Default for MessageCodec<Tx, Rx> {
     fn default() -> Self {
         Self(Default::default(), Default::default())
