@@ -2,7 +2,6 @@
 use crate::message::{self, Clientbound, MessageCodec, Serverbound};
 use crate::server::Client;
 use bytes::Bytes;
-use futures::{channel::oneshot::channel, prelude::*};
 use openssl::{
     envelope::Open,
     error::{Error as SslError, ErrorStack},
@@ -11,10 +10,11 @@ use openssl::{
 };
 use sha3::{Digest, Sha3_512};
 use std::io::Read;
+use std::marker::PhantomData;
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+    sync::mpsc::{error, unbounded_channel, UnboundedReceiver, UnboundedSender},
 };
 use tokio_stream::StreamExt;
 use tokio_util::codec::{Decoder, Framed};
@@ -28,8 +28,9 @@ pub enum ClientError {
 
     #[error(transparent)]
     RsaError(#[from] ErrorStack),
-    // #[error(transparent)]
-    // HashingError(#[from] )
+
+    #[error(transparent)]
+    SendStringError(#[from] error::SendError<String>),
 }
 
 // We're gonna need to define the interface from Client to Server & from Server to Client, but can't be same struct b/c of ownership.
@@ -38,35 +39,61 @@ pub struct ChatClient {
     // hostname: String,
     // keypair: Rsa<Private>,
     // tcp_stream: MessageStream,
-    pub terminal_channel: TerminalChannel,
+    pub terminal_task: TerminalTask,
 }
 
 // This channel sends stuff from the client to the terminal.
-struct ClientChannel {
-    pub inbound: UnboundedReceiver<String>,
-    pub outbound: UnboundedSender<String>,
-}
-impl ClientChannel {
-    fn new(inbound: UnboundedReceiver<String>, outbound: UnboundedSender<String>) -> Self {
-        ClientChannel { inbound, outbound }
-    }
-}
-
-// Chat client takes stuff from the terminal and sends it.
-pub struct TerminalChannel {
+struct ClientTask {
     pub inbound: UnboundedSender<String>,
     pub outbound: UnboundedReceiver<String>,
     pub tcp_stream: MessageStream,
     pub keypair: Rsa<Private>,
 }
-impl TerminalChannel {
+impl ClientTask {
     fn new(
+        // From terminal
         inbound: UnboundedSender<String>,
+        // To server
         outbound: UnboundedReceiver<String>,
         tcp_stream: MessageStream,
         keypair: Rsa<Private>,
     ) -> Self {
-        TerminalChannel { inbound, outbound, tcp_stream, keypair }
+        ClientTask {
+            inbound,
+            outbound,
+            tcp_stream,
+            keypair,
+        }
+    }
+
+    // Tokio doesn't have a 2-way channel, pain ;-;
+    async fn run_background_task(mut self) {
+        loop {
+            // recieves OUTBOUND data FROM the terminal and sends SERVERBOUND data TO the server. (Gods this was confusing LOL)
+
+            // Any data we recieve from the terminal, we send to the server
+            // Any data we get from the server we send to the terminal.
+            // self.inbound.send().await
+            // self.outbound.recv().await // user messages
+
+            tokio::select! {
+                msg_from_server  = self.tcp_stream.next() => {}, // If we get data from the server, send it to the terminal.
+                msg_from_terminal = self.outbound.recv() => {}, // If we get data from the terminal, send it to the server
+            }
+        }
+
+        // Sends inbound msg to terminal and receives outbound messages.
+    }
+}
+
+// Chat client takes stuff from the terminal and sends it.
+pub struct TerminalTask {
+    pub inbound: UnboundedReceiver<String>,
+    pub outbound: UnboundedSender<String>,
+}
+impl TerminalTask {
+    fn new(inbound: UnboundedReceiver<String>, outbound: UnboundedSender<String>) -> Self {
+        TerminalTask { inbound, outbound }
     }
 }
 
@@ -83,21 +110,15 @@ impl ChatClient {
 
         let keypair = ChatClient::generate_keypair(None)?;
 
-        let terminal_channel = TerminalChannel::new(inbound_tx, outbound_rx, message_stream, keypair);
-        let client_channel = ClientChannel::new(inbound_rx, outbound_tx);
+        let terminal_task = TerminalTask::new(inbound_rx, outbound_tx);
+        let client_task = ClientTask::new(inbound_tx, outbound_rx, message_stream, keypair);
 
         // Spawn our client background task.
-        tokio::spawn(ChatClient::run_background_task(client_channel));
+        tokio::spawn(client_task.run_background_task());
 
-        Ok(ChatClient {
-            terminal_channel,
-        })
+        Ok(ChatClient { terminal_task })
     }
 
-    // Yes, it looks backwards, tokio doesn't have a 2-way channel ;-;
-    async fn run_background_task(client_channel: ClientChannel) {
-        // Sends inbound msg to terminal and receives outbound messages.
-    }
     // This generates a pub/priv keypair for making a server connection, generates a new keypair if there already exists one. Note: Should not be called outside of the server_connect function.
 
     fn generate_keypair(keysize: Option<u32>) -> Result<Rsa<Private>, ClientError> {
