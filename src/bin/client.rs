@@ -39,14 +39,20 @@ async fn main() -> Result<()> {
         select! {
             msg = readline.next() => {
                 match msg {
-                    Some(msg) => readline.get_mut().println(format_args!("> {msg}")),
+                    Some(msg) => {
+                        readline.get_mut().println(format_args!("> {msg}"));
+                        _ = chat_client.terminal_task.outbound.send(msg);
+                    }
                     None => break
                 }
             }
             msg = chat_client.terminal_task.inbound.recv() => {
                 match msg {
                     Some(msg) => readline.get_mut().println(format_args!("< {msg}")),
-                    None => readline.get_mut().println(format_args!("Connection closed."))
+                    None => {
+                        readline.get_mut().println(format_args!("Connection closed."));
+                        break;
+                    }
                 }
             }
         }

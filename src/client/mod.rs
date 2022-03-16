@@ -91,7 +91,7 @@ impl ClientTask {
                 msg_from_terminal = self.outbound.recv() => {
                     match msg_from_terminal {
                         None => {break;},
-                        Some(message) => {self.tcp_stream.feed(message::Serverbound::Message{message});},
+                        Some(message) => {self.tcp_stream.send(message::Serverbound::Message{message}).await.expect("todo: handle error");},
                     }
                 }, // If we get data from the terminal, send it to the server
             }
@@ -125,11 +125,15 @@ impl ChatClient {
 
         let keypair = ChatClient::generate_keypair(None)?;
 
-        message_stream.feed(message::Serverbound::Hello{public_key: keypair.public_key_to_pem()?});
+        message_stream
+            .send(message::Serverbound::Hello {
+                public_key: keypair.public_key_to_pem()?,
+            })
+            .await?;
 
         let terminal_task = TerminalTask::new(inbound_rx, outbound_tx);
         let client_task = ClientTask::new(inbound_tx, outbound_rx, message_stream, keypair);
-        
+
         // Spawn our client background task.
         tokio::spawn(client_task.run_background_task());
 
@@ -154,7 +158,6 @@ impl ChatClient {
 
     // Client hashes the pkey and sends the result to the server, returns Result<(), ClientError>.
     fn server_pkey_exchange(&self) -> Result<(), ClientError> {
-
         Ok(())
     }
 
@@ -164,15 +167,6 @@ impl ChatClient {
 
     async fn encrypt_message(&self, msg: String) -> Result<Vec<u8>, ClientError> {
         Ok(vec![1, 2, 3, 4])
-    }
-
-    pub async fn terminate_connection(&mut self) -> Result<(), ClientError> {
-        Ok(())
-    }
-
-    // Background Tokio task to send a message. However,
-    pub async fn send_message(&mut self, msg: String) -> Result<(), ClientError> {
-        Ok(())
     }
 
     // Takes no parameters, instead it'll attempt to connect to the stuff listed by

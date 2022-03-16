@@ -233,6 +233,7 @@ impl<
     > ClientEventLoop<'s, S>
 {
     async fn run(&mut self) -> Result<(), Error> {
+        let mut timer = tokio::time::interval(tokio::time::Duration::from_secs(5));
         loop {
             tokio::select! {
                 message = self.stream.next() => {
@@ -247,6 +248,10 @@ impl<
                         None => break, // The server closed the connection.
                     }
                 }
+                _ = timer.tick() => {
+                    println!("tick");
+                    self.stream.feed(message::Clientbound::Message { message: "Tick!".to_string() }).await?;
+                }
             };
             self.stream.flush().await?;
         }
@@ -256,7 +261,13 @@ impl<
 
     async fn handle_message(&mut self, message: message::Serverbound) -> Result<(), Error> {
         match message {
-            
+            message::Serverbound::Message { message } => {
+                self.stream
+                    .send(message::Clientbound::Message {
+                        message: format!("{} to you too!", message),
+                    })
+                    .await?
+            }
             m => return Err(Error::UnexpectedMessage(m)),
         };
 
