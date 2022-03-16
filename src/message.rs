@@ -21,13 +21,13 @@ pub struct MessageCodec<Tx: Serialize, Rx: DeserializeOwned>(
     std::marker::PhantomData<Rx>,
 );
 
-impl<Tx: Serialize, Rx: DeserializeOwned> Default for MessageCodec<Tx, Rx> {
+impl <Tx: Serialize, Rx: DeserializeOwned> Default for MessageCodec<Tx, Rx> {
     fn default() -> Self {
         Self(Default::default(), Default::default())
     }
 }
 
-impl<Tx: Serialize, Rx: DeserializeOwned> codec::Encoder<Tx> for MessageCodec<Tx, Rx> {
+impl <Tx: Serialize, Rx: DeserializeOwned> codec::Encoder<Tx> for MessageCodec<Tx, Rx> {
     type Error = std::io::Error;
 
     fn encode(&mut self, item: Tx, dst: &mut bytes::BytesMut) -> Result<(), Self::Error> {
@@ -38,7 +38,7 @@ impl<Tx: Serialize, Rx: DeserializeOwned> codec::Encoder<Tx> for MessageCodec<Tx
         Ok(())
     }
 }
-impl<Tx: Serialize, Rx: DeserializeOwned> codec::Decoder for MessageCodec<Tx, Rx> {
+impl <Tx: Serialize, Rx: DeserializeOwned> codec::Decoder for MessageCodec<Tx, Rx> {
     type Error = std::io::Error;
     type Item = Rx;
 
