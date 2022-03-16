@@ -18,8 +18,8 @@ use crate::message;
 pub enum Error {
     #[error("unexpected message: {0:?}")]
     UnexpectedMessage(message::Serverbound),
-    #[error("duplicate client (public key {0} is already connected)")]
-    DuplicateClient(String),
+    #[error("duplicate client (public key {0:?} is already connected)")]
+    DuplicateClient(Vec<u8>),
     #[error("I/O error")]
     IoError(
         #[from]
@@ -30,7 +30,7 @@ pub enum Error {
 
 /// The server, which listens for and keeps track of clients.
 pub struct Server {
-    clients: RwLock<HashMap<String, Client>>,
+    clients: RwLock<HashMap<Vec<u8>, Client>>,
 }
 
 impl Server {
@@ -88,7 +88,7 @@ impl Server {
         }
     }
 
-    pub async fn unregister_client(&self, client: &str) {
+    pub async fn unregister_client(&self, client: &[u8]) {
         self.clients.write().await.remove(client);
     }
 }
@@ -120,7 +120,7 @@ impl ShutdownHandle {
 }
 
 pub struct Client {
-    public_key: String,
+    public_key: Vec<u8>,
     /* TODO: we'll probably want this eventually
     address: std::net::SocketAddr,
     */
@@ -256,8 +256,7 @@ impl<
 
     async fn handle_message(&mut self, message: message::Serverbound) -> Result<(), Error> {
         match message {
-            message::Serverbound::Ping => self.stream.feed(message::Clientbound::Pong).await?,
-            message::Serverbound::Pong => {}
+            
             m => return Err(Error::UnexpectedMessage(m)),
         };
 

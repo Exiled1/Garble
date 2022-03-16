@@ -2,6 +2,7 @@
 use crate::message::{self, Clientbound, MessageCodec, Serverbound};
 use crate::server::Client;
 use bytes::Bytes;
+use futures::SinkExt;
 use openssl::{
     envelope::Open,
     error::{Error as SslError, ErrorStack},
@@ -77,8 +78,22 @@ impl ClientTask {
             // self.outbound.recv().await // user messages
 
             tokio::select! {
-                msg_from_server  = self.tcp_stream.next() => {}, // If we get data from the server, send it to the terminal.
-                msg_from_terminal = self.outbound.recv() => {}, // If we get data from the terminal, send it to the server
+                msg_from_server  = self.tcp_stream.next() => {
+                    match msg_from_server {
+                        None => {break;},
+                        Some(Err(e)) => {todo!("{e}")},
+                        Some(Ok(message::Clientbound::Shutdown{message})) => {todo!("{message}")}
+                        Some(Ok(message::Clientbound::Message{message})) => {
+                            self.inbound.send(message);
+                        }
+                    }
+                }, // If we get data from the server, send it to the terminal.
+                msg_from_terminal = self.outbound.recv() => {
+                    match msg_from_terminal {
+                        None => {break;},
+                        Some(message) => {self.tcp_stream.feed(message::Serverbound::Message{message});},
+                    }
+                }, // If we get data from the terminal, send it to the server
             }
         }
 
@@ -106,13 +121,15 @@ impl ChatClient {
         let (inbound_tx, inbound_rx) = unbounded_channel();
         let (outbound_tx, outbound_rx) = unbounded_channel();
 
-        let message_stream = ChatClient::connect(hostname, port).await?;
+        let mut message_stream = ChatClient::connect(hostname, port).await?;
 
         let keypair = ChatClient::generate_keypair(None)?;
 
+        message_stream.feed(message::Serverbound::Hello{public_key: keypair.public_key_to_pem()?});
+
         let terminal_task = TerminalTask::new(inbound_rx, outbound_tx);
         let client_task = ClientTask::new(inbound_tx, outbound_rx, message_stream, keypair);
-
+        
         // Spawn our client background task.
         tokio::spawn(client_task.run_background_task());
 
@@ -137,6 +154,7 @@ impl ChatClient {
 
     // Client hashes the pkey and sends the result to the server, returns Result<(), ClientError>.
     fn server_pkey_exchange(&self) -> Result<(), ClientError> {
+
         Ok(())
     }
 

@@ -4,16 +4,15 @@ use tokio_util::codec;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Clientbound {
-    Ping,
-    Pong,
+    Message{message: String},
     Shutdown { message: String },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Serverbound {
-    Hello { public_key: String },
-    Ping,
-    Pong,
+    Hello { public_key: Vec<u8> },
+    Message{ message: String },
+    
 }
 
 pub struct MessageCodec<Tx: Serialize, Rx: DeserializeOwned>(

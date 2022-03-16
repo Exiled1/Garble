@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
                     None => break
                 }
             }
-            msg = chat_client.terminal_channel.outbound.recv() => {
+            msg = chat_client.terminal_task.inbound.recv() => {
                 match msg {
                     Some(msg) => readline.get_mut().println(format_args!("< {msg}")),
                     None => readline.get_mut().println(format_args!("Connection closed."))
