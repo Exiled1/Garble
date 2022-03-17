@@ -1,6 +1,12 @@
-# What is Garble?
+# Garble
 
-Garble is a Rust implementation of the E2E peer-to-peer chat encrypted application. The users can input a host name and a port number to create a chatroom. Another user then is able to join the chatroom and chat through CLI.
+An end-to-end-encrypted command line chat application, allowing users to communicate securely and privately with one another through a central, untrusted server.
+
+## Overview
+
+Garble is written in Rust using the [Tokio](https://tokio.rs) asynchronous networking stack for client/server communication, and [OpenSSL](https://www.openssl.org/) for standard, well-audited implementations of cryptographic primitives. We use a hybrid encryption scheme, using RSA for an initial handshake in order to securely exchange keys for the AES-256-GCM encryption scheme used to encrypt chat messages.
+
+For simplicity, Garble assumes that the users have the one-time ability to exchange key fingerprints over a secure channel. This is intended as a "placeholder" for a more complicated identity verification scheme that is beyond the scope of this project. Garble also currently does not implement persistent storage of keys, or multi-user chat rooms -- you can launch an instance of Garble to create a single chat session, but there is no concept of persistent identity across sessions.
 
 ## Installation and Building
 
@@ -15,19 +21,40 @@ To build the app, Rust and Git will be needed. The following steps contains the 
     2. Clone the Garble repo
 
         ```bash
-        git clone https://github.com/Exiled1/Garble.git
+        git clone https://github.com/Exiled1/Garble
+        cd Garble
         ```
 
-    3. Run the code
+    3. Run the server
     
         ```bash
-        cargo run
+        cargo run --bin server    # or cargo run --bin server -- [hostname][:port]
         ```
 
-## Security Overview
+    4. Run clients
+    
+        ```bash
+        cargo run --bin client    # or cargo run --bin client -- [hostname][:port]
+        ```
 
-Garble is built using the _Tokio_ asynchronous networking stack for client/server communcations and _OpenSSL_ for the starndard implementation of cryptographic primatives.
+## Security Analysis
 
-For the implementation of the cryptography scheme, the hybrid encryption is chosen for this task to ensure the large message between the users can be sent. The encryption is _AES256 GCM_ and _RSA2048_.
+Garble's encryption scheme works as follows:
 
-Use asymmetric encryption to generate a private and public key for the users. Use RSA key size of 2048, use fingerprint and exchange through a separate secured channel to prevent a middle man attack. One of the client is randomly chosen to generate the session key that will be used for the symmetric encryption for the chatroom. This session key will be encrypted with _RSA2048_ encryption and sign using the sender's private key, then it is shared to the other user, while the server cannot do anything to this encrypted key. The users can rely on the symmetric key encryption to be able to send messages back and forth without their messages being seen by anyone else. 
+- When Alice starts her client, it generates a 2048-bit RSA public/private keypair and sends the public key to the server.
+- The client then prompts the user to enter the key fingerprint (i.e. the SHA3-256 hash of the public key) of Bob, the peer to establish a chat session with.
+- Alice's client sends a connection request to the server containing Bob's key fingerprint (as entered by Alice).
+- The server waits until Bob sends a connection request containing Alice's key fingerprint.
+- The server arbitrarily nominates one of the two clients to choose a *session key* -- i.e. a 256-bit key to use for AES-GCM encryption. For this example, suppose the server nominates Bob. The server sends Bob a request to choose the key; this request packet also includes Alice's public key.
+- Bob's client verifies that Alice's public key (as recieved by the server) matches Alice's key fingerprint (as entered by Bob). It then generates a random session key, encrypts it using Alice's public key, signs it using Bob's private key, and sends it to the server.
+- The server forwards this information to Alice, along with Bob's public key. Alice verifies that Bob's public key matches the expected fingerprint, and verifies & decrypts the encrypted session key.
+- The two clients now have a shared secret which they can use to securely encrypt messages.
+
+We use AES-256-GCM to encrypt messages because OpenSSL provides a convenient implementation. However, we currently do not make use of the associated data; we always set it to empty in order to use the scheme as an authenticated encryption scheme rather than an AEAD scheme.
+
+We believe this scheme to be CCA-secure even in the presence of an untrusted server. The server cannot defeat the key exchange because:
+- RSA is believed to be a secure signature scheme and a CPA-secure enctyption scheme. Therefore, the encrypt-then-sign scheme should be CCA-secure (similar to an encrypt-than-MAC scheme).
+- The server only has the ability to ask a client to generate, encrypt, and sign a key; or to verify, decrypt, and then use a key. Assuming RSA encrypt-then-sign is CCA-secure, the server cannot decrypt a key generated by a client, and cannot forge a key not generated by a client.
+
+The server cannot defeat the message exchange because AES-256-GCM is believed to be a CCA-secure authenticated encryption scheme. The attacker learns no information about plaintexts except their length, and cannot forge plaintexts that were not generated by clients. However, our implementation is vulnerable to replay attacks: the server can re-send messages that were previously transmitted by clients, and can additionally delay, drop or reorder messages. (We can prevent this attack by tagging messages with a sequence number, and having clients reject out-of-sequence messages -- we would have implemented this if we had a little more time.)
+
