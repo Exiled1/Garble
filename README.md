@@ -8,34 +8,34 @@ Garble is written in Rust using the [Tokio](https://tokio.rs) asynchronous netwo
 
 For simplicity, Garble assumes that the users have the one-time ability to exchange key fingerprints over a secure channel. This is intended as a "placeholder" for a more complicated identity verification scheme that is beyond the scope of this project. Garble also currently does not implement persistent storage of keys, or multi-user chat rooms -- you can launch an instance of Garble to create a single chat session, but there is no concept of persistent identity across sessions.
 
-## Installation and Building
+## Building and Running
 
 To build the app, Rust and Git will be needed. The following steps contains the instruction on how to install Rust and run the code.
 
-    1. Install Rust
+1. Install Rust (if you haven't already)
 
-        ```bash
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-        ```
+    ```bash
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    ```
 
-    2. Clone the Garble repo
+2. Clone the Garble repo
 
-        ```bash
-        git clone https://github.com/Exiled1/Garble
-        cd Garble
-        ```
+    ```bash
+    git clone https://github.com/Exiled1/Garble
+    cd Garble
+    ```
 
-    3. Run the server
-    
-        ```bash
-        cargo run --bin server    # or cargo run --bin server -- [hostname][:port]
-        ```
+3. Run the server
 
-    4. Run clients
-    
-        ```bash
-        cargo run --bin client    # or cargo run --bin client -- [hostname][:port]
-        ```
+    ```bash
+    cargo run --bin server    # or cargo run --bin server -- [hostname][:port]
+    ```
+
+4. Run clients
+
+    ```bash
+    cargo run --bin client    # or cargo run --bin client -- [hostname][:port]
+    ```
 
 ## Security Analysis
 
