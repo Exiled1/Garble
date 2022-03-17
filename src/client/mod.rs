@@ -8,10 +8,12 @@ use openssl::{
     error::{Error as SslError, ErrorStack},
     pkey::Private,
     rsa::{Padding, Rsa},
+    sha::Sha256
 };
-use sha3::{Digest, Sha3_512};
+
 use std::io::Read;
 use std::marker::PhantomData;
+use std::string::FromUtf8Error;
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -19,7 +21,7 @@ use tokio::{
 };
 use tokio_stream::StreamExt;
 use tokio_util::codec::{Decoder, Framed};
-
+mod crypto;
 type MessageStream = Framed<TcpStream, MessageCodec<Serverbound, Clientbound>>;
 
 #[derive(Error, Debug)]
@@ -30,8 +32,11 @@ pub enum ClientError {
     #[error(transparent)]
     RsaError(#[from] ErrorStack),
 
-    #[error(transparent)]
-    SendStringError(#[from] error::SendError<String>),
+    #[error("Invalid signature")]
+    InvalidSignature,
+
+    #[error("Invalid utf8 conversion")]
+    InvalidConversion(#[from] FromUtf8Error)
 }
 
 // We're gonna need to define the interface from Client to Server & from Server to Client, but can't be same struct b/c of ownership.
@@ -48,7 +53,6 @@ struct ClientTask {
     pub inbound: UnboundedSender<String>,
     pub outbound: UnboundedReceiver<String>,
     pub tcp_stream: MessageStream,
-    pub keypair: Rsa<Private>,
 }
 impl ClientTask {
     fn new(
@@ -63,7 +67,7 @@ impl ClientTask {
             inbound,
             outbound,
             tcp_stream,
-            keypair,
+            // keypair,
         }
     }
 
@@ -127,7 +131,7 @@ impl ChatClient {
 
         message_stream
             .send(message::Serverbound::Hello {
-                public_key: keypair.public_key_to_pem()?,
+                public_key: keypair.public_key_to_der()?,
             })
             .await?;
 
@@ -148,13 +152,13 @@ impl ChatClient {
     }
 
     // Simply hashes the public key and returns the string result of it. This is for identifying a user while giving no information to the server.
-    // fn hash_pub_key(&mut self) -> Result<Vec<u8>, ClientError> {
-    //     let mut hasher = Sha3_512::new();
-    //     hasher.update(self.keypair.public_key_to_pem().as_ref().unwrap());
-    //     let hash = hasher.finalize();
-    //     let hashed_pub_key = hash.bytes().collect::<Result<Vec<u8>, std::io::Error>>()?;
-    //     Ok(hashed_pub_key)
-    // }
+    fn hash_pub_key(keypair: Rsa<Private> ) -> Result<Vec<u8>, ClientError> {
+        let mut hasher = Sha256::new();
+        hasher.update(keypair.public_key_to_der().as_ref().unwrap());
+        let hash = hasher.finish();
+        let hashed_pub_key = hash.bytes().collect::<Result<Vec<u8>, std::io::Error>>()?;
+        Ok(hashed_pub_key)
+    }
 
     // Client hashes the pkey and sends the result to the server, returns Result<(), ClientError>.
     fn server_pkey_exchange(&self) -> Result<(), ClientError> {
@@ -165,9 +169,7 @@ impl ChatClient {
     fn stream_send(&mut self, server_bound_msg: message::Serverbound) {}
     // ---------------- Public API --------------------
 
-    async fn encrypt_message(&self, msg: String) -> Result<Vec<u8>, ClientError> {
-        Ok(vec![1, 2, 3, 4])
-    }
+    
 
     // Takes no parameters, instead it'll attempt to connect to the stuff listed by
     async fn connect(hostname: String, port: usize) -> Result<MessageStream, ClientError> {
