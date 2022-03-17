@@ -1,3 +1,5 @@
+//! Server implementation
+
 use futures::prelude::*;
 use std::{
     collections::{hash_map::Entry, HashMap},
@@ -10,10 +12,11 @@ use tokio::{
     sync::{self, mpsc, oneshot, RwLock},
     task,
 };
-use tokio_util::codec::Decoder;
+use tokio_util::codec::{self, Decoder};
 
 use crate::{crypto, message};
 
+/// Things that can go wrong server-side
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("unexpected message: {0:?}")]
@@ -32,11 +35,12 @@ pub enum Error {
 
 /// The server, which listens for and keeps track of clients.
 pub struct Server {
+    /// The set of clients connected to the server, identified by key fingerprint.
     clients: RwLock<HashMap<String, Client>>,
 }
 
 impl Server {
-    /// Starts the server, completing once the server is up-and-running.
+    /// Starts a background task for the server, completing once the server is up-and-running.
     pub async fn start(bind_addr: &str) -> std::io::Result<ShutdownHandle> {
         let server = Server {
             clients: RwLock::new(HashMap::new()),
@@ -52,12 +56,15 @@ impl Server {
         })
     }
 
+    /// Implementation of the server background task
     async fn _run(self, listener: net::TcpListener, mut shutdown_rx: sync::oneshot::Receiver<()>) {
-        let s = Arc::new(self);
+        let s = Arc::new(self); // The server is reference-counted so that it can be shared among clients
         loop {
             tokio::select! {
+                // Do we have an incoming connection?
                 incoming = listener.accept() => {
                     match incoming {
+                        // Start a new client
                         Ok((stream, addr)) => Client::start(s.clone(), stream, addr),
                         Err(e) => {
                             eprintln!("listen error: {e}");
@@ -65,6 +72,7 @@ impl Server {
                         }
                     };
                 },
+                // Or have we been told to shut down?
                 _ = &mut shutdown_rx => {
                     break
                 }
@@ -80,6 +88,7 @@ impl Server {
         }
     }
 
+    /// Registers a client in the server's list.
     pub async fn register_client(&self, client: Client) -> Result<(), Error> {
         match self
             .clients
@@ -95,6 +104,7 @@ impl Server {
         }
     }
 
+    /// Removes a client from the server's list.
     pub async fn unregister_client(&self, client: &str) {
         self.clients.write().await.remove(client);
     }
@@ -102,7 +112,10 @@ impl Server {
 
 /// A handle the application can use to shut down the server.
 pub struct ShutdownHandle {
+    // A channel used to request a shutdown.
     tx: sync::oneshot::Sender<()>,
+
+    // A join handle used to wait for a shutdown.
     join: tokio::task::JoinHandle<()>,
 }
 
@@ -126,11 +139,28 @@ impl ShutdownHandle {
     }
 }
 
+/// The server-side representation of a client.
+/// The client is split into two structures; this is the external interface used by the server &
+/// other clients. It contains some useful information about the client, and communication channels
+/// that can be used to communicate with the client's event loop.
 pub struct Client {
+    /// This client's DER-encoded public key.
     public_key: Vec<u8>,
+
+    /// This client's key fingerprint: the base64-encoded SHA3-256 hash of the public key.
     key_fingerprint: String,
+
+    /// A channel that can be used to transmit packets to the client.
+    /// The event loop monitors this channel & forwards any packets over the client's socket.
     tx: mpsc::UnboundedSender<message::Clientbound>,
+
+    /// A channel that can be used to request the creation of a chat session with this client.
+    /// To request a connection, send the public key fingerprint of the client requesting the
+    /// connection, and a callback channel that on which to indicate whether the request succeeded.
     request_connection_tx: mpsc::UnboundedSender<(String, oneshot::Sender<bool>)>,
+
+    /// The client's join handle, so the server can wait for its
+    /// event loop to finish before shutting down.
     join_handle: task::JoinHandle<()>,
 }
 
@@ -138,14 +168,22 @@ impl Client {
     /// Creates and runs a Client.
     /// Returns immediately, spawning a new task for the client.
     pub fn start(server: Arc<Server>, stream: net::TcpStream, address: std::net::SocketAddr) {
+        // Create communication channels...
         let (tx, rx) = sync::mpsc::unbounded_channel();
         let (join_handle_tx, join_handle_rx) = sync::oneshot::channel();
         let (request_connection_tx, request_connection_rx) = mpsc::unbounded_channel();
+
+        // and spawn a background tas for the client
         let join_handle = tokio::task::spawn(async move {
             let join_handle = join_handle_rx.await.unwrap();
 
             println!("Connected to {address}");
+
+            // Wrap the raw TCP stream in a codec that encodes & decodes JSON packets
+            // See src/message.rs
             let mut stream = message::MessageCodec::default().framed(stream);
+
+            // Wait for the client to start the handshake
             let result = match stream.next().await {
                 Some(Ok(message::Serverbound::Hello { public_key })) => {
                     async {
@@ -179,23 +217,24 @@ impl Client {
                         .run()
                         .await;
 
-                        if let Err(ref e) = result {
-                            println!("Client {address} disconnected due to error: {e}");
-                        }
-
+                        // The event loop has terminated. Unregister the client from the server.
                         server.unregister_client(&key_fingerprint).await;
                         result
                     }
                     .await
                 }
+
+                // The client should not send anything but a "hello" packet.
                 Some(Ok(m)) => Err(Error::UnexpectedMessage(m)),
                 Some(Err(e)) => Err(Error::from(e)),
                 None => Ok(()),
             };
 
+            // The client has exited; log the disconnect.
             match result {
                 Ok(()) => println!("Client {address} disconnected"),
                 Err(e) => {
+                    // If it was due to an error, log the error and forward it to the client.
                     println!("Client {address} disconnected: {e}");
                     _ = stream
                         .send(message::Clientbound::Shutdown {
@@ -227,16 +266,16 @@ impl Client {
     }
 }
 
-struct ClientEventLoop<
-    's,
-    S: Stream<Item = std::io::Result<message::Serverbound>>
-        + Sink<message::Clientbound, Error = std::io::Error>
-        + Unpin,
-> {
+/// The implementation of the server's per-client event loop.
+struct ClientEventLoop<'s> {
+    /// A reference to the server.
     server: Arc<Server>,
     public_key: Vec<u8>,
     key_fingerprint: String,
-    stream: &'s mut S,
+    stream: &'s mut codec::Framed<
+        net::TcpStream,
+        message::MessageCodec<message::Clientbound, message::Serverbound>,
+    >,
     rx: mpsc::UnboundedReceiver<message::Clientbound>,
 
     dst_client_fingerprint: Option<String>,
@@ -246,34 +285,38 @@ struct ClientEventLoop<
     outstanding_connection_requests: HashMap<String, oneshot::Sender<bool>>,
 }
 
-impl<
-        's,
-        S: Stream<Item = std::io::Result<message::Serverbound>>
-            + Sink<message::Clientbound, Error = std::io::Error>
-            + Unpin,
-    > ClientEventLoop<'s, S>
-{
+impl<'s> ClientEventLoop<'s> {
+    /// Runs the client event loop.
     async fn run(&mut self) -> Result<(), Error> {
         loop {
+            // Wait for an event...
             tokio::select! {
                 message = self.stream.next() => {
                     match message.transpose()? {
+                        // We recieved a message from the client.
                         Some(m) => self.handle_message(m).await?,
-                        None => break,  // The client closed the connection.
+
+                        // The client closed the connection; exit the event loop.
+                        None => break,
                     }
                 },
                 message = self.rx.recv() => {
                     match message {
+                        // We have a message to be sent to the client.
                         Some(m) => self.stream.feed(m).await?,
-                        None => break, // The server closed the connection.
+
+                        // The server is shutting down.
+                        None => break,
                     }
                 }
                 request = self.request_connection_rx.recv() => {
                     match request {
+                        // Someone requested a chat session with this client.
                         Some((peer, resp)) => if self.dst_client_fingerprint.is_none() {
+                            // Keep track of the request.
                             self.outstanding_connection_requests.insert(peer, resp);
                         } else {
-                            // We already have a connection, reject the request.
+                            // We already have a session, reject the request.
                             _ = resp.send(false);
                         }
                         None => {
@@ -284,9 +327,13 @@ impl<
                     }
                 }
                 response = async { self.dst_client_request.as_mut().unwrap().await }, if self.dst_client_request.is_some() => {
+                    // Someone responded to our request for a chat session.
+
+                    // We no longer have an outstanding request.
                     self.dst_client_request = None;
+
                     if response.unwrap_or(false) {
-                        // The other client said yes. Select our client to generate a session key
+                        // The other client said yes. (Arbitrarily) select our client to generate a session key
                         let dst_fingerprint = self.dst_client_fingerprint.as_ref().unwrap();
                         if let Some(dst_key) = self.server.clients.read().await.get(dst_fingerprint).map(|c| &c.public_key) {
                             self.stream.feed(message::Clientbound::ChooseKey { dst_public_key: dst_key.clone() }).await?;
@@ -296,6 +343,7 @@ impl<
                             }).await?;
                         }
                     } else {
+                        // The other client said no (or shut down).
                         self.dst_client_fingerprint = None;
                         self.stream.feed(message::Clientbound::Shutdown {
                             message: "Destination client rejected connection".to_string(),
@@ -305,6 +353,9 @@ impl<
             };
             self.stream.flush().await?;
         }
+
+        // We've exited the event loop. If we have an active session,
+        // let the other end know we've disconnected
         if let Some(dst_fingerprint) = self.dst_client_fingerprint.as_ref() {
             if let Some(dst_client) = self.server.clients.read().await.get(dst_fingerprint) {
                 _ = dst_client.tx.send(message::Clientbound::Shutdown {
@@ -312,28 +363,34 @@ impl<
                 });
             }
         }
+
         self.stream.flush().await?;
         Ok(())
     }
 
+    /// Handles packets recieved from the client over the network.
     async fn handle_message(&mut self, message: message::Serverbound) -> Result<(), Error> {
         match message {
             message::Serverbound::ConnectRequest {
                 ref peer_fingerprint,
             } => {
+                // The client has asked to begin a chat session.
+
+                // Make sure we don't already have an active session or outstanding request.
                 if self.dst_client_request.is_some() || self.dst_client_fingerprint.is_some() {
                     return Err(Error::UnexpectedMessage(message));
                 }
 
                 let clients = self.server.clients.read().await;
 
-                // We have a lock on clients, so only one client can be in this function at a time.
+                // We hold a lock on clients, so only one client can be in this function at a time.
                 // To avoid race conditions, make sure we process any incoming connection requests
+                // before submitting one of our own.
                 while let Ok((peer, channel)) = self.request_connection_rx.try_recv() {
                     self.outstanding_connection_requests.insert(peer, channel);
                 }
 
-                // Make sure the client exists
+                // Make sure the destination client exists
                 let dst_client = clients.get(peer_fingerprint);
                 if dst_client.is_none() {
                     self.stream
@@ -360,7 +417,7 @@ impl<
                             .await?;
                     }
                 } else {
-                    // Submit a connection request to this client.
+                    // Submit a connection request to this peer.
                     let (request_tx, request_rx) = oneshot::channel();
                     self.dst_client_request = Some(request_rx);
                     let result = dst_client
@@ -375,7 +432,7 @@ impl<
                     }
                 }
 
-                // If there are any other outsanding connection requests, reject them.
+                // If there are any outsanding connection requests to other clients, reject them.
                 self.outstanding_connection_requests
                     .drain()
                     .for_each(|req| _ = req.1.send(false));
@@ -389,6 +446,9 @@ impl<
                 session_key,
                 signature,
             } => {
+                // The client has given us an encrypted session key to forward to its peer.
+
+                // Make sure it actually has a peer
                 if let Some(dst_fingerprint) = self.dst_client_fingerprint.as_ref() {
                     if let Some(dst_client) = self.server.clients.read().await.get(dst_fingerprint)
                     {
@@ -412,7 +472,10 @@ impl<
                 }
             }
             message::Serverbound::Message(m) => {
+                // The client has sent us an encrypted message to forward to its peer.
                 println!("Intercepted ciphertext: {m:?}");
+
+                // Make sure it actually has a peer
                 if let Some(dst_fingerprint) = self.dst_client_fingerprint.as_ref() {
                     if let Some(dst_client) = self.server.clients.read().await.get(dst_fingerprint)
                     {
@@ -428,7 +491,9 @@ impl<
                     return Err(Error::UnexpectedMessage(message::Serverbound::Message(m)));
                 }
             }
-            m => return Err(Error::UnexpectedMessage(m)),
+
+            // A Hello message wouldn't make any sense, we've already completed the handshake
+            message::Serverbound::Hello { .. } => return Err(Error::UnexpectedMessage(message)),
         };
 
         Ok(())

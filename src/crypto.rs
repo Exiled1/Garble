@@ -1,3 +1,5 @@
+//! Implementations of cryptographic algorithms
+
 use openssl::error::ErrorStack;
 use openssl::hash::{Hasher, MessageDigest};
 use openssl::pkey::{Private, Public};
@@ -40,21 +42,17 @@ pub struct SessionKey {
 }
 
 impl SessionKey {
-    pub fn new(given_key: Option<Vec<u8>>) -> Result<Self, ErrorStack> {
-        match given_key {
-            None => {
-                let mut session_key = [0; 32]; // 32 * 8 = 256
-                rand_bytes(&mut session_key)?;
+    /// Randomly generates a session key.
+    pub fn generate() -> Result<Self, ErrorStack> {
+        let mut session_key = [0; 32]; // 32 * 8 = 256
+        rand_bytes(&mut session_key)?;
 
-                Ok(SessionKey {
-                    session_key: session_key.to_vec(),
-                })
-            }
-            Some(session_key) => Ok(SessionKey { session_key }),
-        }
+        Ok(SessionKey {
+            session_key: session_key.to_vec(),
+        })
     }
 
-    /// Use aes 256 to encrypt
+    /// Use RSA to encrypt & sign the session key.
     pub fn encrypt_session_key(
         &self,
         pub_key: &RsaRef<Public>,
@@ -75,7 +73,7 @@ impl SessionKey {
         Ok((enc_key.to_vec(), signature))
     }
 
-    /// The opposite of encyrpt.
+    /// The opposite of encrypt.
     pub fn decrypt_session_key(
         enc_session_key: Vec<u8>,
         signature: Vec<u8>,
@@ -101,6 +99,7 @@ impl SessionKey {
         }
     }
 
+    /// Uses AES-256-GCM to encrypt a message.
     pub fn session_encrypt_message(
         &self,
         message: String,
@@ -125,6 +124,7 @@ impl SessionKey {
         })
     }
 
+    /// Uses AES-256-GCM to encrypt a message.
     pub fn session_decrypt_message(&self, message: Encrypted) -> Result<String, ClientError> {
         let cipher = Cipher::aes_256_gcm();
         //let mut iv = vec![0; 12]; // 12 * 8 = 96; 128 bit block, with 32 bit counter = 128

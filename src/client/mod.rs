@@ -1,7 +1,10 @@
-use crate::crypto::{self, SessionKey};
+//! The client module, which handles all communication with the server.
+//! The client is split into two Tokio tasks: the terminal task (in src/bin/client.rs), and
+//! the client task which runs in the background (in this file).
+
+use crate::crypto::SessionKey;
 use crate::message::{self, Clientbound, MessageCodec, Serverbound};
 use futures::SinkExt;
-use openssl::{error::ErrorStack, pkey::Private, rsa::Rsa};
 use std::string::FromUtf8Error;
 use thiserror::Error;
 use tokio::{
@@ -9,180 +12,91 @@ use tokio::{
     sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
 };
 use tokio_stream::StreamExt;
-use tokio_util::codec::{Decoder, Framed};
+use tokio_util::codec::Framed;
+
+// Re-export public interfaces from submodules
+mod readline;
+pub use readline::Readline;
+
+mod connect;
+pub use connect::{ChatConnector, ConnectError};
+
+/// A TCP stream that carries null-terminated JSON messages as described in src/message.rs.
 type MessageStream = Framed<TcpStream, MessageCodec<Serverbound, Clientbound>>;
 
+/// An error that can occur while the client is running.
 #[derive(Error, Debug)]
 pub enum ClientError {
+    /// Something went wrong with the network.
     #[error(transparent)]
     IoError(#[from] std::io::Error),
 
+    /// Something went wrong with a cryptographic operation.
     #[error(transparent)]
-    SslError(#[from] ErrorStack),
+    SslError(#[from] openssl::error::ErrorStack),
 
+    /// A key we recieved could not be verified.
     #[error("Invalid signature")]
     InvalidSignature,
 
+    /// A message was not valid UTF-8.
     #[error("Invalid utf8 conversion")]
     InvalidConversion(#[from] FromUtf8Error),
 
+    /// The connection was closed by the server.
     #[error("Server terminated connection: {reason}")]
     ServerShutdown { reason: String },
 
+    /// The server sent a message that was not expected in this context.
     #[error("invalid message recieved from server: {message:?}")]
     InvalidMessage { message: message::Clientbound },
 }
 
-#[derive(Debug)]
-pub struct ChatConnector {
-    tcp_stream: MessageStream,
-    pub keypair: Rsa<Private>,
+/// This structure is held by the terminal task and is the public interface to the client task. It
+/// contains channels that the terminal task can use to send & recieve messages.
+pub struct ChatClient {
+    /// A channel delivering the stream of messages & errors recieved by the client task.
+    pub inbound: UnboundedReceiver<Result<String, ClientError>>,
+
+    /// A channel for sending messages to the client task.
+    pub outbound: UnboundedSender<String>,
 }
+impl ChatClient {
+    /// Creates a ChatClient, given a connection to the server & a sesion key
+    ///
+    /// This method should only be called by ChatConnector, since it requires completing the
+    /// initial handshake to determine the session key.
+    fn new(message_stream: MessageStream, session_key: SessionKey) -> Self {
+        // Make a pair of channels for msg from Terminal to Client thread (outbound messages; user sent).
+        // Then from client to terminal (inbound messages; terminal sent).
+        // Goal is to separate inbound from outbound stuff to a background task.
+        let (inbound_tx, inbound_rx) = unbounded_channel();
+        let (outbound_tx, outbound_rx) = unbounded_channel();
 
-#[derive(Error, Debug)]
-pub enum ConnectError {
-    #[error(transparent)]
-    ClientError(#[from] ClientError),
+        let client_task = ClientTask::new(inbound_tx, outbound_rx, message_stream, session_key);
 
-    #[error("connection failed: {reason}")]
-    ConnectRefused {
-        connector: ChatConnector,
-        reason: String,
-    },
+        // Spawn our client background task.
+        tokio::spawn(client_task.run_background_task());
 
-    // this error message gets an exclamation point because it means someone tried to attack you
-    #[error("key {key:?} does not match requested fingerprint {fingerprint}!")]
-    FingerprintMismatch { fingerprint: String, key: Vec<u8> },
-}
-
-impl ChatConnector {
-    pub async fn new(hostname: &str, port: usize) -> Result<Self, ClientError> {
-        let keypair = crypto::generate_keypair(None)?;
-
-        // TcpStream is not a stream, it's a stream of bytes (NOT A STREAM), I guess it's an AsyncRead/AsyncWrite.
-        let not_a_stream = TcpStream::connect(format!("{hostname}:{port}")).await?;
-        let mut message_stream = message::MessageCodec::default().framed(not_a_stream);
-
-        message_stream
-            .send(message::Serverbound::Hello {
-                public_key: keypair.public_key_to_der()?,
-            })
-            .await?;
-
-        Ok(Self {
-            tcp_stream: message_stream,
-            keypair,
-        })
-    }
-    pub async fn request_connection(
-        mut self,
-        peer_fingerprint: String,
-    ) -> Result<ChatClient, ConnectError> {
-        // Choose a session key & encrypt it with the user's public key
-        self.tcp_stream
-            .send(message::Serverbound::ConnectRequest {
-                peer_fingerprint: peer_fingerprint.clone(),
-            })
-            .await
-            .map_err(ClientError::from)?;
-
-        loop {
-            match self.tcp_stream.next().await {
-                Some(Ok(message::Clientbound::ConnectWaiting)) => continue,
-                Some(Ok(message::Clientbound::ChooseKey { dst_public_key })) => {
-                    if crypto::sha3_256_base64(&dst_public_key) != peer_fingerprint {
-                        return Err(ConnectError::FingerprintMismatch {
-                            fingerprint: peer_fingerprint,
-                            key: dst_public_key,
-                        });
-                    }
-
-                    let dst_public_key =
-                        Rsa::public_key_from_der(&dst_public_key).map_err(ClientError::from)?;
-
-                    // Generate a temporary AES key for the session.
-                    let key = SessionKey::new(None).map_err(ClientError::from)?;
-
-                    // Encrypt it with the peer's public key, and sign it with our private key.
-                    let (encrypted, signature) = key
-                        .encrypt_session_key(dst_public_key.as_ref(), self.keypair.as_ref())
-                        .map_err(ClientError::from)?;
-
-                    // Send the encyrpted key to the other client.
-                    self.tcp_stream
-                        .send(message::Serverbound::UseKey {
-                            session_key: encrypted,
-                            signature,
-                        })
-                        .await
-                        .map_err(ClientError::from)?;
-                    break Ok(ChatClient::new(self.tcp_stream, key));
-                }
-                Some(Ok(message::Clientbound::UseKey {
-                    dst_public_key,
-                    session_key,
-                    signature,
-                })) => {
-                    if crypto::sha3_256_base64(&dst_public_key) != peer_fingerprint {
-                        return Err(ConnectError::FingerprintMismatch {
-                            fingerprint: peer_fingerprint,
-                            key: dst_public_key,
-                        });
-                    }
-
-                    let dst_public_key =
-                        Rsa::public_key_from_der(&dst_public_key).map_err(ClientError::from)?;
-                    let session_key = SessionKey::decrypt_session_key(
-                        session_key,
-                        signature,
-                        self.keypair.as_ref(),
-                        dst_public_key.as_ref(),
-                    )?;
-
-                    break Ok(ChatClient::new(self.tcp_stream, session_key));
-                }
-                Some(Ok(message::Clientbound::ConnectFail { reason })) => {
-                    break Err(ConnectError::ConnectRefused {
-                        connector: self,
-                        reason,
-                    })
-                }
-
-                Some(Ok(message::Clientbound::Shutdown { message })) => {
-                    break Err(ConnectError::from(ClientError::ServerShutdown {
-                        reason: message,
-                    }))
-                }
-                None => {
-                    break Err(ConnectError::from(ClientError::ServerShutdown {
-                        reason: "socket closed by remote server".to_string(),
-                    }))
-                }
-
-                Some(Ok(message)) => {
-                    break Err(ConnectError::from(ClientError::InvalidMessage { message }))
-                }
-
-                Some(Err(e)) => break Err(ConnectError::from(ClientError::from(e))),
-            }
+        ChatClient {
+            inbound: inbound_rx,
+            outbound: outbound_tx,
         }
     }
 }
 
-// We're gonna need to define the interface from Client to Server & from Server to Client, but can't be same struct b/c of ownership.
-pub struct ChatClient {
-    // port: usize,
-    // hostname: String,
-    // keypair: Rsa<Private>,
-    // tcp_stream: MessageStream,
-    pub terminal_task: TerminalTask,
-}
-
-// This channel sends stuff from the client to the terminal.
+/// This structure contains the internal state of the client task.
 struct ClientTask {
-    pub inbound: UnboundedSender<Result<String, ClientError>>,
-    pub outbound: UnboundedReceiver<String>,
-    pub tcp_stream: MessageStream,
+    /// Sends messages & errors to the terminal task.
+    inbound: UnboundedSender<Result<String, ClientError>>,
+
+    /// Recieves messages from the terminal task.
+    outbound: UnboundedReceiver<String>,
+
+    /// The stream of packets to & from the server.
+    tcp_stream: MessageStream,
+
+    /// The AES-256-GCM key used to encrypt messages.
     session_key: SessionKey,
 }
 impl ClientTask {
@@ -216,69 +130,54 @@ impl ClientTask {
             let result = async {
                 tokio::select! {
                     msg_from_server  = self.tcp_stream.next() => {
+                        // We got a message! What is it?
                         match msg_from_server {
+                            // The connection has been closed; stop.
                             None => closed = true,
+
+                            // Something went wrong, bail out.
                             Some(Err(e)) => return Err(ClientError::from(e)),
+
+                            // The server has asked us to shut down, stop & raise an "error".
                             Some(Ok(message::Clientbound::Shutdown{message})) => {
                                 closed = true;
                                 return Err(ClientError::ServerShutdown { reason: message });
                             }
+
+                            // We've recieved an encrypted message.
                             Some(Ok(message::Clientbound::Message(m))) => {
+                                // Decrypt it...
                                 let decrypted = self.session_key.session_decrypt_message(m)?;
+                                // and send it to the terminal atsk
                                 _ = self.inbound.send(Ok(decrypted));
                             }
+
+                            // We've recieved some other message, which doesn't make any sense.
                             Some(Ok(message)) => return Err(ClientError::InvalidMessage { message })
                         }
-                    }, // If we get data from the server, send it to the terminal.
+                    },
                     msg_from_terminal = self.outbound.recv() => {
+                        // The user entered something on the terminal!
                         match msg_from_terminal {
+                            // The terminal has been closed, stop.
                             None => closed = true,
+
                             Some(message) => {
+                                // The user entered a message. Encrypt it...
                                 let encrypted = self.session_key.session_encrypt_message(message)?;
+                                // ...and send it over the network.
                                 self.tcp_stream.send(message::Serverbound::Message(encrypted)).await?;
                             },
                         }
-                    }, // If we get data from the terminal, send it to the server
+                    },
                 };
                 Ok(())
             }.await;
 
             if let Err(e) = result {
+                // If we returned an error, forward it to the terminal task.
                 _ = self.inbound.send(Err(e));
             }
         }
-    }
-}
-
-pub struct TerminalTask {
-    // Chat client takes stuff from the terminal and sends it.
-    pub inbound: UnboundedReceiver<Result<String, ClientError>>,
-    pub outbound: UnboundedSender<String>,
-}
-impl TerminalTask {
-    fn new(
-        inbound: UnboundedReceiver<Result<String, ClientError>>,
-        outbound: UnboundedSender<String>,
-    ) -> Self {
-        TerminalTask { inbound, outbound }
-    }
-}
-
-impl ChatClient {
-    // Makes a connection to the port:hostname, and sets our username, does not set the pub/priv key pair yet.
-    fn new(message_stream: MessageStream, session_key: SessionKey) -> Self {
-        // Make a pair of channels for msg from Terminal to Client thread (outbound messages; user sent).
-        // Then from client to terminal (inbound messages; terminal sent).
-        // Goal is to separate inbound from outbound stuff to a background task.
-        let (inbound_tx, inbound_rx) = unbounded_channel();
-        let (outbound_tx, outbound_rx) = unbounded_channel();
-
-        let terminal_task = TerminalTask::new(inbound_rx, outbound_tx);
-        let client_task = ClientTask::new(inbound_tx, outbound_rx, message_stream, session_key);
-
-        // Spawn our client background task.
-        tokio::spawn(client_task.run_background_task());
-
-        ChatClient { terminal_task }
     }
 }
