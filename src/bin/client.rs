@@ -9,7 +9,7 @@ use std::{
 };
 use tokio::select;
 
-use garble::client::ChatClient;
+use garble::client::{ChatClient, ChatConnector, ConnectError};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -30,7 +30,36 @@ async fn main() -> Result<()> {
     }
     let port = port.unwrap_or(3000);
 
-    let mut chat_client = ChatClient::new(port, host).await?; // make a new client
+    let mut connector = ChatConnector::new(&host, port).await?;
+
+    println!(
+        "Your key fingerprint is:\n{}",
+        garble::crypto::hash_pub_key(&connector.keypair)
+    );
+    let mut chat_client: ChatClient = loop {
+        print!("Enter the key fingerprint of the user you want to chat with: ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if input.is_empty() {
+            // EOF
+            return Ok(());
+        }
+
+        println!("Waiting for connection...");
+        match connector.request_connection(input.trim().to_string()).await {
+            Ok(client) => break client,
+            Err(ConnectError::ConnectRefused {
+                connector: c,
+                reason,
+            }) => {
+                println!("Connection refused: {reason}");
+                connector = c;
+                continue;
+            }
+            Err(e) => anyhow::bail!(e),
+        }
+    };
 
     println!("Connected!");
     let mut readline = Readline::new("> ".to_string()).fuse();
@@ -48,9 +77,9 @@ async fn main() -> Result<()> {
             }
             msg = chat_client.terminal_task.inbound.recv() => {
                 match msg {
-                    Some(msg) => readline.get_mut().println(format_args!("< {msg}")),
+                    Some(Ok(msg)) => readline.get_mut().println(format_args!("< {msg}")),
+                    Some(Err(e)) => readline.get_mut().println(format_args!("{e}")),
                     None => {
-                        readline.get_mut().println(format_args!("Connection closed."));
                         break;
                     }
                 }

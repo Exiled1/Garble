@@ -11,7 +11,7 @@ pub enum Serverbound {
 
     /// Sent by a client to request an E2E-encrypted channel with another client.
     /// Includes the key fingerprint of the peer to chat with (the SHA3-256 hash of their key),
-    ConnectRequest { peer_fingerprint: Vec<u8> },
+    ConnectRequest { peer_fingerprint: String },
 
     /// The client's response to a ChooseKey packet.
     UseKey {
@@ -20,10 +20,7 @@ pub enum Serverbound {
     },
 
     /// Send an encrypted message to another client.
-    Message {
-        encrypted_content: Vec<u8>,
-        tag: Vec<u8>,
-    },
+    Message(Encrypted),
 }
 
 /// Packets that can be sent from the client to the server.
@@ -50,14 +47,19 @@ pub enum Clientbound {
     },
 
     /// Another client has sent an encrypted message.
-    Message {
-        encrypted_content: Vec<u8>,
-        tag: Vec<u8>,
-    },
+    Message(Encrypted),
 
     /// The server is terminating the connection. message is a human-readable reason for the
     /// shutdown.
     Shutdown { message: String },
+}
+
+/// A message that has been encrypted and MACed.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Encrypted {
+    pub iv: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+    pub tag: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -72,7 +74,9 @@ impl<Tx: Serialize, Rx: DeserializeOwned> Default for MessageCodec<Tx, Rx> {
     }
 }
 
-impl<Tx: Serialize, Rx: DeserializeOwned> codec::Encoder<Tx> for MessageCodec<Tx, Rx> {
+impl<Tx: Serialize + std::fmt::Debug, Rx: DeserializeOwned> codec::Encoder<Tx>
+    for MessageCodec<Tx, Rx>
+{
     type Error = std::io::Error;
 
     fn encode(&mut self, item: Tx, dst: &mut bytes::BytesMut) -> Result<(), Self::Error> {
@@ -83,7 +87,9 @@ impl<Tx: Serialize, Rx: DeserializeOwned> codec::Encoder<Tx> for MessageCodec<Tx
         Ok(())
     }
 }
-impl<Tx: Serialize, Rx: DeserializeOwned> codec::Decoder for MessageCodec<Tx, Rx> {
+impl<Tx: Serialize, Rx: DeserializeOwned + std::fmt::Debug> codec::Decoder
+    for MessageCodec<Tx, Rx>
+{
     type Error = std::io::Error;
     type Item = Rx;
 

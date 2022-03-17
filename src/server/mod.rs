@@ -12,7 +12,7 @@ use tokio::{
 };
 use tokio_util::codec::Decoder;
 
-use crate::message;
+use crate::{crypto, message};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -32,7 +32,7 @@ pub enum Error {
 
 /// The server, which listens for and keeps track of clients.
 pub struct Server {
-    clients: RwLock<HashMap<Vec<u8>, Client>>,
+    clients: RwLock<HashMap<String, Client>>,
 }
 
 impl Server {
@@ -81,7 +81,12 @@ impl Server {
     }
 
     pub async fn register_client(&self, client: Client) -> Result<(), Error> {
-        match self.clients.write().await.entry(client.public_key.clone()) {
+        match self
+            .clients
+            .write()
+            .await
+            .entry(client.key_fingerprint.clone())
+        {
             Entry::Occupied(_) => Err(Error::DuplicateClient(client.public_key.clone())),
             Entry::Vacant(entry) => {
                 entry.insert(client);
@@ -90,7 +95,7 @@ impl Server {
         }
     }
 
-    pub async fn unregister_client(&self, client: &[u8]) {
+    pub async fn unregister_client(&self, client: &str) {
         self.clients.write().await.remove(client);
     }
 }
@@ -123,8 +128,9 @@ impl ShutdownHandle {
 
 pub struct Client {
     public_key: Vec<u8>,
+    key_fingerprint: String,
     tx: mpsc::UnboundedSender<message::Clientbound>,
-    request_connection_tx: mpsc::UnboundedSender<(Vec<u8>, oneshot::Sender<bool>)>,
+    request_connection_tx: mpsc::UnboundedSender<(String, oneshot::Sender<bool>)>,
     join_handle: task::JoinHandle<()>,
 }
 
@@ -145,10 +151,11 @@ impl Client {
                     async {
                         // We recieved a valid "hello" message from the client.
                         // Register the client with the server...
+                        let key_fingerprint = crypto::sha3_256_base64(&public_key);
                         server
                             .register_client(Client {
                                 public_key: public_key.clone(),
-                                //address,
+                                key_fingerprint: key_fingerprint.clone(),
                                 tx,
                                 request_connection_tx,
                                 join_handle,
@@ -156,10 +163,10 @@ impl Client {
                             .await?;
 
                         // and run the client's event loop.
-                        #[allow(unreachable_code, clippy::diverging_sub_expression)]
                         let result = ClientEventLoop {
-                            server,
-                            key_fingerprint: todo!(),
+                            server: server.clone(),
+                            public_key,
+                            key_fingerprint: key_fingerprint.clone(),
                             stream: &mut stream,
                             rx,
 
@@ -172,11 +179,11 @@ impl Client {
                         .run()
                         .await;
 
-                        if let Err(e) = result {
+                        if let Err(ref e) = result {
                             println!("Client {address} disconnected due to error: {e}");
                         }
 
-                        server.unregister_client(&public_key).await;
+                        server.unregister_client(&key_fingerprint).await;
                         result
                     }
                     .await
@@ -227,15 +234,16 @@ struct ClientEventLoop<
         + Unpin,
 > {
     server: Arc<Server>,
-    key_fingerprint: Vec<u8>,
+    public_key: Vec<u8>,
+    key_fingerprint: String,
     stream: &'s mut S,
     rx: mpsc::UnboundedReceiver<message::Clientbound>,
 
-    dst_client_fingerprint: Option<Vec<u8>>,
+    dst_client_fingerprint: Option<String>,
     dst_client_request: Option<oneshot::Receiver<bool>>,
 
-    request_connection_rx: mpsc::UnboundedReceiver<(Vec<u8>, oneshot::Sender<bool>)>,
-    outstanding_connection_requests: HashMap<Vec<u8>, oneshot::Sender<bool>>,
+    request_connection_rx: mpsc::UnboundedReceiver<(String, oneshot::Sender<bool>)>,
+    outstanding_connection_requests: HashMap<String, oneshot::Sender<bool>>,
 }
 
 impl<
@@ -275,7 +283,8 @@ impl<
                         }
                     }
                 }
-                response = self.dst_client_request.as_mut().unwrap(), if self.dst_client_request.is_some() => {
+                response = async { self.dst_client_request.as_mut().unwrap().await }, if self.dst_client_request.is_some() => {
+                    self.dst_client_request = None;
                     if response.unwrap_or(false) {
                         // The other client said yes. Select our client to generate a session key
                         let dst_fingerprint = self.dst_client_fingerprint.as_ref().unwrap();
@@ -287,6 +296,7 @@ impl<
                             }).await?;
                         }
                     } else {
+                        self.dst_client_fingerprint = None;
                         self.stream.feed(message::Clientbound::Shutdown {
                             message: "Destination client rejected connection".to_string(),
                         }).await?;
@@ -294,6 +304,13 @@ impl<
                 }
             };
             self.stream.flush().await?;
+        }
+        if let Some(dst_fingerprint) = self.dst_client_fingerprint.as_ref() {
+            if let Some(dst_client) = self.server.clients.read().await.get(dst_fingerprint) {
+                _ = dst_client.tx.send(message::Clientbound::Shutdown {
+                    message: "Remote peer ended the chat".to_string(),
+                });
+            }
         }
         self.stream.flush().await?;
         Ok(())
@@ -325,6 +342,7 @@ impl<
                                 .to_string(),
                         })
                         .await?;
+                    return Ok(());
                 }
                 let dst_client = dst_client.unwrap();
 
@@ -367,16 +385,17 @@ impl<
                     .feed(message::Clientbound::ConnectWaiting)
                     .await?;
             }
-            message::Serverbound::Message {
-                ref encrypted_content,
-                ref tag,
+            message::Serverbound::UseKey {
+                session_key,
+                signature,
             } => {
                 if let Some(dst_fingerprint) = self.dst_client_fingerprint.as_ref() {
                     if let Some(dst_client) = self.server.clients.read().await.get(dst_fingerprint)
                     {
-                        _ = dst_client.tx.send(message::Clientbound::Message {
-                            encrypted_content: encrypted_content.clone(),
-                            tag: tag.clone(),
+                        _ = dst_client.tx.send(message::Clientbound::UseKey {
+                            dst_public_key: self.public_key.clone(),
+                            session_key,
+                            signature,
                         });
                     } else {
                         self.stream
@@ -386,7 +405,27 @@ impl<
                             .await?;
                     }
                 } else {
-                    return Err(Error::UnexpectedMessage(message));
+                    return Err(Error::UnexpectedMessage(message::Serverbound::UseKey {
+                        session_key,
+                        signature,
+                    }));
+                }
+            }
+            message::Serverbound::Message(m) => {
+                println!("Intercepted ciphertext: {m:?}");
+                if let Some(dst_fingerprint) = self.dst_client_fingerprint.as_ref() {
+                    if let Some(dst_client) = self.server.clients.read().await.get(dst_fingerprint)
+                    {
+                        _ = dst_client.tx.send(message::Clientbound::Message(m));
+                    } else {
+                        self.stream
+                            .feed(message::Clientbound::Shutdown {
+                                message: "Destination client disconnected".to_string(),
+                            })
+                            .await?;
+                    }
+                } else {
+                    return Err(Error::UnexpectedMessage(message::Serverbound::Message(m)));
                 }
             }
             m => return Err(Error::UnexpectedMessage(m)),
