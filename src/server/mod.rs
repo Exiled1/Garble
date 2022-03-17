@@ -7,7 +7,7 @@ use std::{
 use thiserror::Error;
 use tokio::{
     net,
-    sync::{self, mpsc, RwLock},
+    sync::{self, mpsc, oneshot, RwLock},
     task,
 };
 use tokio_util::codec::Decoder;
@@ -18,8 +18,10 @@ use crate::message;
 pub enum Error {
     #[error("unexpected message: {0:?}")]
     UnexpectedMessage(message::Serverbound),
-    #[error("duplicate client (public key {0:?} is already connected)")]
+
+    #[error("duplicate client (public key fingerprint {0:?} is already connected)")]
     DuplicateClient(Vec<u8>),
+
     #[error("I/O error")]
     IoError(
         #[from]
@@ -121,10 +123,8 @@ impl ShutdownHandle {
 
 pub struct Client {
     public_key: Vec<u8>,
-    /* TODO: we'll probably want this eventually
-    address: std::net::SocketAddr,
-    */
     tx: mpsc::UnboundedSender<message::Clientbound>,
+    request_connection_tx: mpsc::UnboundedSender<(Vec<u8>, oneshot::Sender<bool>)>,
     join_handle: task::JoinHandle<()>,
 }
 
@@ -134,6 +134,7 @@ impl Client {
     pub fn start(server: Arc<Server>, stream: net::TcpStream, address: std::net::SocketAddr) {
         let (tx, rx) = sync::mpsc::unbounded_channel();
         let (join_handle_tx, join_handle_rx) = sync::oneshot::channel();
+        let (request_connection_tx, request_connection_rx) = mpsc::unbounded_channel();
         let join_handle = tokio::task::spawn(async move {
             let join_handle = join_handle_rx.await.unwrap();
 
@@ -149,22 +150,31 @@ impl Client {
                                 public_key: public_key.clone(),
                                 //address,
                                 tx,
+                                request_connection_tx,
                                 join_handle,
                             })
                             .await?;
 
                         // and run the client's event loop.
+                        #[allow(unreachable_code, clippy::diverging_sub_expression)]
                         let result = ClientEventLoop {
-                            /*
                             server,
-                            public_key,
-                            address,
-                            */
+                            key_fingerprint: todo!(),
                             stream: &mut stream,
                             rx,
+
+                            dst_client_fingerprint: None,
+                            dst_client_request: None,
+
+                            request_connection_rx,
+                            outstanding_connection_requests: HashMap::new(),
                         }
                         .run()
                         .await;
+
+                        if let Err(e) = result {
+                            println!("Client {address} disconnected due to error: {e}");
+                        }
 
                         server.unregister_client(&public_key).await;
                         result
@@ -216,13 +226,16 @@ struct ClientEventLoop<
         + Sink<message::Clientbound, Error = std::io::Error>
         + Unpin,
 > {
-    /* TODO: we'll want these eventually
     server: Arc<Server>,
-    public_key: String,
-    address: std::net::SocketAddr,
-    */
+    key_fingerprint: Vec<u8>,
     stream: &'s mut S,
     rx: mpsc::UnboundedReceiver<message::Clientbound>,
+
+    dst_client_fingerprint: Option<Vec<u8>>,
+    dst_client_request: Option<oneshot::Receiver<bool>>,
+
+    request_connection_rx: mpsc::UnboundedReceiver<(Vec<u8>, oneshot::Sender<bool>)>,
+    outstanding_connection_requests: HashMap<Vec<u8>, oneshot::Sender<bool>>,
 }
 
 impl<
@@ -233,7 +246,6 @@ impl<
     > ClientEventLoop<'s, S>
 {
     async fn run(&mut self) -> Result<(), Error> {
-        let mut timer = tokio::time::interval(tokio::time::Duration::from_secs(5));
         loop {
             tokio::select! {
                 message = self.stream.next() => {
@@ -248,9 +260,37 @@ impl<
                         None => break, // The server closed the connection.
                     }
                 }
-                _ = timer.tick() => {
-                    println!("tick");
-                    self.stream.feed(message::Clientbound::Message { message: "Tick!".to_string() }).await?;
+                request = self.request_connection_rx.recv() => {
+                    match request {
+                        Some((peer, resp)) => if self.dst_client_fingerprint.is_none() {
+                            self.outstanding_connection_requests.insert(peer, resp);
+                        } else {
+                            // We already have a connection, reject the request.
+                            _ = resp.send(false);
+                        }
+                        None => {
+                            _ = self.stream.feed(message::Clientbound::Shutdown {
+                                message: "Destination client disconnected".to_string(),
+                            }).await;
+                        }
+                    }
+                }
+                response = self.dst_client_request.as_mut().unwrap(), if self.dst_client_request.is_some() => {
+                    if response.unwrap_or(false) {
+                        // The other client said yes. Select our client to generate a session key
+                        let dst_fingerprint = self.dst_client_fingerprint.as_ref().unwrap();
+                        if let Some(dst_key) = self.server.clients.read().await.get(dst_fingerprint).map(|c| &c.public_key) {
+                            self.stream.feed(message::Clientbound::ChooseKey { dst_public_key: dst_key.clone() }).await?;
+                        } else {
+                            self.stream.feed(message::Clientbound::Shutdown {
+                                message: "Destination client disconnected".to_string(),
+                            }).await?;
+                        }
+                    } else {
+                        self.stream.feed(message::Clientbound::Shutdown {
+                            message: "Destination client rejected connection".to_string(),
+                        }).await?;
+                    }
                 }
             };
             self.stream.flush().await?;
@@ -261,12 +301,93 @@ impl<
 
     async fn handle_message(&mut self, message: message::Serverbound) -> Result<(), Error> {
         match message {
-            message::Serverbound::Message { message } => {
+            message::Serverbound::ConnectRequest {
+                ref peer_fingerprint,
+            } => {
+                if self.dst_client_request.is_some() || self.dst_client_fingerprint.is_some() {
+                    return Err(Error::UnexpectedMessage(message));
+                }
+
+                let clients = self.server.clients.read().await;
+
+                // We have a lock on clients, so only one client can be in this function at a time.
+                // To avoid race conditions, make sure we process any incoming connection requests
+                while let Ok((peer, channel)) = self.request_connection_rx.try_recv() {
+                    self.outstanding_connection_requests.insert(peer, channel);
+                }
+
+                // Make sure the client exists
+                let dst_client = clients.get(peer_fingerprint);
+                if dst_client.is_none() {
+                    self.stream
+                        .feed(message::Clientbound::ConnectFail {
+                            reason: "No client with the specified key fingerprint is connected."
+                                .to_string(),
+                        })
+                        .await?;
+                }
+                let dst_client = dst_client.unwrap();
+
+                // Do we have an outstanding connection request from this peer?
+                if let Some(req) = self
+                    .outstanding_connection_requests
+                    .remove(peer_fingerprint)
+                {
+                    // Yes, approve the request. The peer will then begin the key exchange.
+                    if req.send(true).is_err() {
+                        self.stream
+                            .feed(message::Clientbound::Shutdown {
+                                message: "Destination client disconnected".to_string(),
+                            })
+                            .await?;
+                    }
+                } else {
+                    // Submit a connection request to this client.
+                    let (request_tx, request_rx) = oneshot::channel();
+                    self.dst_client_request = Some(request_rx);
+                    let result = dst_client
+                        .request_connection_tx
+                        .send((self.key_fingerprint.clone(), request_tx));
+                    if result.is_err() {
+                        self.stream
+                            .feed(message::Clientbound::Shutdown {
+                                message: "Destination client disconnected".to_string(),
+                            })
+                            .await?;
+                    }
+                }
+
+                // If there are any other outsanding connection requests, reject them.
+                self.outstanding_connection_requests
+                    .drain()
+                    .for_each(|req| _ = req.1.send(false));
+
+                self.dst_client_fingerprint = Some(peer_fingerprint.clone());
                 self.stream
-                    .send(message::Clientbound::Message {
-                        message: format!("{} to you too!", message),
-                    })
-                    .await?
+                    .feed(message::Clientbound::ConnectWaiting)
+                    .await?;
+            }
+            message::Serverbound::Message {
+                ref encrypted_content,
+                ref tag,
+            } => {
+                if let Some(dst_fingerprint) = self.dst_client_fingerprint.as_ref() {
+                    if let Some(dst_client) = self.server.clients.read().await.get(dst_fingerprint)
+                    {
+                        _ = dst_client.tx.send(message::Clientbound::Message {
+                            encrypted_content: encrypted_content.clone(),
+                            tag: tag.clone(),
+                        });
+                    } else {
+                        self.stream
+                            .feed(message::Clientbound::Shutdown {
+                                message: "Destination client disconnected".to_string(),
+                            })
+                            .await?;
+                    }
+                } else {
+                    return Err(Error::UnexpectedMessage(message));
+                }
             }
             m => return Err(Error::UnexpectedMessage(m)),
         };
